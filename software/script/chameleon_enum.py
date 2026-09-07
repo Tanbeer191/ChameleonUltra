@@ -317,6 +317,7 @@ class TagSpecificType(enum.IntEnum):
     # Visa2000
     Viking = 170
     # Noralsy
+    Noralsy = 175
     Jablotron = 180
 
     # FSK Tag-Talk-First      200
@@ -413,6 +414,8 @@ class TagSpecificType(enum.IntEnum):
             return "PAC/Stanley"
         elif self == TagSpecificType.Viking:
             return "Viking"
+        elif self == TagSpecificType.Noralsy:
+            return "Noralsy"
         elif self == TagSpecificType.Jablotron:
             return "Jablotron"
         elif self == TagSpecificType.IDTECK:

@@ -13,6 +13,7 @@
 #include "protocols/idteck.h"
 #include "protocols/ioprox.h"
 #include "protocols/jablotron.h"
+#include "protocols/noralsy.h"
 #include "protocols/pac.h"
 #include "protocols/viking.h"
 #include "syssleep.h"
@@ -288,6 +289,15 @@ int lf_tag_data_loadcb(tag_specific_type_t type, tag_data_buffer_t *buffer) {
         return LF_IDTECK_TAG_ID_SIZE;
     }
 
+    if (type == TAG_TYPE_NORALSY && buffer->length >= LF_NORALSY_TAG_ID_SIZE) {
+        m_tag_type = type;
+        void *codec = noralsy.alloc();
+        m_pwm_seq = noralsy.modulator(codec, buffer->buffer);
+        noralsy.free(codec);
+        NRF_LOG_INFO("load lf noralsy data finish.");
+        return LF_NORALSY_TAG_ID_SIZE;
+    }
+
     NRF_LOG_ERROR("no valid data exists in buffer for tag type: %d.", type);
     return 0;
 }
@@ -442,6 +452,24 @@ bool lf_tag_idteck_data_factory(uint8_t slot, tag_specific_type_t tag_type) {
     uint8_t tag_id[LF_IDTECK_TAG_ID_SIZE] = {
         0x49, 0x44, 0x54, 0x4B,   // "IDTK" preamble (MSB first)
         0xDE, 0xAD, 0xBE, 0xEF,   // default card data
+    };
+    return lf_tag_data_factory(slot, tag_type, tag_id, sizeof(tag_id));
+}
+
+/** @brief Noralsy data save callback. */
+int lf_tag_noralsy_data_savecb(tag_specific_type_t type, tag_data_buffer_t *buffer) {
+    return m_tag_type == TAG_TYPE_NORALSY ? LF_NORALSY_TAG_ID_SIZE : 0;
+}
+
+/** @brief Noralsy empty default frame.
+ *  Layout: [0..3] id (uint32 BE), [4..5] year (uint16 BE), [6..7] padding.
+ *  STUB: no default card is shipped. Set your own card id and year via the
+ *  client before use (e.g. `hw slot type -t Noralsy` then write the data). */
+bool lf_tag_noralsy_data_factory(uint8_t slot, tag_specific_type_t tag_type) {
+    uint8_t tag_id[LF_NORALSY_TAG_ID_SIZE] = {
+        0x00, 0x00, 0x00, 0x00,   // id  (big-endian) — STUB: fill in your own
+        0x00, 0x00,               // year (big-endian) — STUB: fill in your own
+        0x00, 0x00,               // padding
     };
     return lf_tag_data_factory(slot, tag_type, tag_id, sizeof(tag_id));
 }

@@ -69,6 +69,13 @@ extern "C" {
     T5577_PWD |                \
     (2 << T5577_MAXBLOCK_SHIFT))
 
+#define T5577_NORALSY_CONFIG (    \
+    T5577_BITRATE_RF_32 |         \
+    T5577_MODULATION_MANCHESTER | \
+    T5577_ST_TERMINATOR |         \
+    T5577_PWD |                   \
+    (3 << T5577_MAXBLOCK_SHIFT))
+
 #define T5577_VIKING_CONFIG (     \
     T5577_BITRATE_RF_32 |         \
     T5577_MODULATION_MANCHESTER | \
