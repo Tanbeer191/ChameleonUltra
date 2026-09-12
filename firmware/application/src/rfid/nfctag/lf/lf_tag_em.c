@@ -461,14 +461,14 @@ int lf_tag_noralsy_data_savecb(tag_specific_type_t type, tag_data_buffer_t *buff
     return m_tag_type == TAG_TYPE_NORALSY ? LF_NORALSY_TAG_ID_SIZE : 0;
 }
 
-/** @brief Noralsy empty default frame.
- *  Layout: [0..3] id (uint32 BE), [4..5] year (uint16 BE), [6..7] padding.
- *  STUB: no default card is shipped. Set your own card id and year via the
- *  client before use (e.g. `hw slot type -t Noralsy` then write the data). */
+/** @brief Noralsy default frame: placeholder card id 1234567, year 2000.
+ *  This is only an example default; set the real card via the client.
+ *  Layout: [0..3] id (uint32 BE), [4..5] year (uint16 BE), [6..7] padding. */
 bool lf_tag_noralsy_data_factory(uint8_t slot, tag_specific_type_t tag_type) {
+    // 1234567 = 0x0012D687 ; 2000 = 0x07D0
     uint8_t tag_id[LF_NORALSY_TAG_ID_SIZE] = {
-        0x00, 0x00, 0x00, 0x00,   // id  (big-endian) — STUB: fill in your own
-        0x00, 0x00,               // year (big-endian) — STUB: fill in your own
+        0x00, 0x12, 0xD6, 0x87,   // id 1234567 (big-endian, placeholder)
+        0x07, 0xD0,               // year 2000 (big-endian, placeholder)
         0x00, 0x00,               // padding
     };
     return lf_tag_data_factory(slot, tag_type, tag_id, sizeof(tag_id));

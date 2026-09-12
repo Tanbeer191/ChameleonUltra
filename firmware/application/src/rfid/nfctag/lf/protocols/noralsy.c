@@ -12,7 +12,7 @@
 
 /*
  * Noralsy LF tag protocol
- * ASK / Manchester, RF/32, 96-bit frame.
+ * ASK / Manchester, RF/32, 96-bit frame, T5577 Sequence Terminator (ST).
  *
  * Frame layout (bit index, MSB-first), from Proxmark3 getnoralsyBits():
  *   bits  0-31 : fixed prefix 0xBB0214FF (12-bit preamble 0xBB0 + rest)
@@ -36,18 +36,66 @@
  *   [4..5] year      (uint16, big-endian)
  *   [6..7] padding
  *
- * NOTE: a real Noralsy T5577 uses the T5577 Sequence Terminator (ST) to mark
- * the block boundary. This emulator does not emit an explicit ST; it repeats
- * the 96-bit Manchester frame so the reader syncs on the 0xBB0 preamble, the
- * same way Proxmark3's demodNoralsy locates the card. Verify against a real
- * Noralsy reader (or `lf search` on a Proxmark3) before relying on it.
- *
  * Reference: Proxmark3 cmdlfnoralsy.c
  */
 
 #define NORALSY_RAW_SIZE (96)
+
+// The emitted PWM sequence is a HYBRID of two proven techniques:
+//
+//   1. DATA (96 entries): the 96 Manchester data bits are rendered with the
+//      exact per-bit RF/32 Manchester that viking.c / em410x.c use and that
+//      Proxmark3 decodes reliably -- one PWM entry per bit, counter_top = 32,
+//      channel_0 = (bit ? 0x8000 : 0) | 16. That is a mid-bit 50% toggle whose
+//      polarity bit (0x8000) selects the Manchester transition direction. A
+//      transition every bit period keeps the envelope moving, so no data level
+//      is held flat long enough to droop below the demod threshold -- this is
+//      what lets PM3 `lf noralsy demod` read all 96 bits cleanly. (An earlier
+//      held-level data replay drooped on sustained highs, merging runs and
+//      corrupting the read; the per-bit toggle fixes that.)
+//
+//   2. TERMINATOR (NORALSY_ST_LEN entries, appended after the data): the real
+//      T5577 Sequence Terminator, reproduced EXACTLY from the genuine fob and
+//      real-key captures. It is the 128-sample (= clk*4) pattern "H16 L16 H48
+//      L16 H32" that sits immediately before the BB0 preamble on a real tag
+//      (measured identically on both the fob and the real key). Rendered as
+//      glitch-free UNLOADED (full-carrier) HIGH holds and brief SHORTED LOWs.
+//
+//      Why this exact length and shape matter (PM3 `lf noralsy demod` path):
+//      demodNoralsy() calls ASKDemod with ST detection, DetectST() finds the ST,
+//      then TRIMS it out assuming every ST is exactly clk*4 = 128 samples
+//      (lfdemod.c: "dataloc += clk*4"), leaving pure 96-bit data frames; then
+//      detectNoralsy() requires consecutive BB0 preambles to be EXACTLY 96 bits
+//      apart (preambleSearchEx sets size = gap; demod rejects size != 96). A
+//      terminator of any other length (our earlier 144-sample "L16 H48 L16 H48
+//      L16") makes DetectST mis-measure datalen (3088 % 32 != 0) or drift the
+//      trim, so the preambles are not 96 apart and decode fails -- even though a
+//      plain `data rawdemod --am` still recovers the bits. 128 samples fixes it.
+//
+//      The two long HIGH holds PM3 findST locks onto are formed by: the explicit
+//      H48, plus the trailing H32 merging with the preamble's first HIGH half-bit
+//      (bit0 = 1) into a second 48-clock hold. The leading H16 merges with data
+//      bit95's trailing HIGH half-bit, so the emitted envelope around the ST is
+//      "H32 L16 H48 L16 H48" -- bit-identical to the genuine tag. Holds are
+//      UNLOADED (LF_MOD low = FET off = LC tank free-running at full amplitude),
+//      each bracketed by only a brief 16-clock short so the tank never droops;
+//      on hardware these measured highToLow 46/45, matching fob 46/46.
+//
+// Splice cleanliness / glitch-free: every ST entry uses channel_0 = 0 (pin low /
+// HIGH env) or counter_top+1 (pin high / LOW env), never channel_0 == counter_top.
+// Strict HIGH<->LOW alternation holds at the data<->ST junctions except the two
+// intentional HIGH-HIGH merges above (which form the holds and add no glitch);
+// max run stays 48, and the 3200-sample (100-bit-period) frame loops seamlessly.
+#define NORALSY_ST_LEN (5)
+#define NORALSY_PWM_SIZE (NORALSY_RAW_SIZE + NORALSY_ST_LEN)  // 96 data + 5 ST = 101
 #define NORALSY_DATA_SIZE (8)
 #define NORALSY_T55XX_BLOCK_COUNT (4)  // config + 3 data blocks
+
+// RF/32 Manchester per-bit timing (carrier clocks at the 125kHz PWM base clock).
+#define NORALSY_BIT_TOP (32)      // one bit period = RF/32
+#define NORALSY_BIT_TOGGLE (16)   // mid-bit 50% toggle point
+#define NORALSY_ST_HOLD (48)      // ST long-hold duration (>1.5*clock so findST passes)
+#define NORALSY_ST_GAP (16)       // brief LOW between/around the ST holds (tank recovers)
 
 // Manchester edge timing for RF/32 (same thresholds as Viking, also RF/32)
 #define NORALSY_READ_TIME1_BASE (0x20)
@@ -63,7 +111,29 @@ NRF_LOG_MODULE_REGISTER();
 
 static const uint8_t noralsy_preamble[12] = {1, 0, 1, 1, 1, 0, 1, 1, 0, 0, 0, 0};
 
-static nrf_pwm_values_wave_form_t m_noralsy_pwm_seq_vals[NORALSY_RAW_SIZE] = {};
+// Real T5577 Sequence Terminator, appended after the 96 data bits, reproducing
+// the genuine tag's exact 128-sample (clk*4) pattern "H16 L16 H48 L16 H32" that
+// sits immediately before the BB0 preamble. Each entry is {counter_top,
+// channel_0}; channel_0 uses ONLY the glitch-free held convention -- 0 holds the
+// pin fully LOW (LF_MOD low = unloaded = HIGH envelope / full carrier),
+// counter_top+1 holds it fully HIGH (LF_MOD high = shorted = LOW envelope); never
+// channel_0 == counter_top (that boundary can emit a 1-tick glitch). The leading
+// H16 merges with data bit95's trailing HIGH half-bit and the trailing H32 merges
+// with the preamble bit0's HIGH half-bit, so the emitted envelope is the genuine
+// "H32 L16 H48 L16 H48" two-hold ST. Total = 16+16+48+16+32 = 128 = clk*4, which
+// is exactly what PM3 DetectST trims, so frames stay 96 bits apart and decode.
+static const struct {
+    uint8_t counter_top;
+    uint16_t channel_0;
+} NORALSY_ST[NORALSY_ST_LEN] = {
+    {NORALSY_BIT_TOGGLE, 0},                // H16  (merges w/ data bit95 -> H32 pre-hold)
+    {NORALSY_ST_GAP, NORALSY_ST_GAP + 1},   // L16  (brief short; tank recovers)
+    {NORALSY_ST_HOLD, 0},                   // H48  (unloaded long hold #1)
+    {NORALSY_ST_GAP, NORALSY_ST_GAP + 1},   // L16  (brief short; tank recovers)
+    {NORALSY_BIT_TOP, 0},                   // H32  (merges w/ preamble bit0 -> long hold #2)
+};
+
+static nrf_pwm_values_wave_form_t m_noralsy_pwm_seq_vals[NORALSY_PWM_SIZE] = {};
 
 nrf_pwm_sequence_t const m_noralsy_pwm_seq = {
     .values.p_wave_form = m_noralsy_pwm_seq_vals,
@@ -274,16 +344,41 @@ static bool noralsy_decoder_feed(noralsy_codec *d, uint16_t interval) {
 // ---- modulator (emulation) -------------------------------------------------
 
 static const nrf_pwm_sequence_t *noralsy_modulator(noralsy_codec *d, uint8_t *buf) {
+    (void)d;
     uint8_t bits[NORALSY_RAW_SIZE];
-    noralsy_frame_from_data(buf, bits);
+    noralsy_frame_from_data(buf, bits);  // data-driven from the slot card id/year
 
+    uint16_t idx = 0;
+
+    // --- 96 DATA bits: proven per-bit RF/32 Manchester (viking.c convention) ---
+    // Each bit is one PWM entry: counter_top = 32 (RF/32 bit period), a mid-bit
+    // 50% toggle at 16, and the polarity bit (0x8000) selects the Manchester
+    // transition direction from the data bit. Identical to the rendering PM3
+    // decodes for Viking/EM410x and to the earlier Noralsy build that `lf noralsy
+    // demod` read successfully. A transition every bit period keeps the envelope
+    // moving so no data level droops below the demod threshold.
     for (int i = 0; i < NORALSY_RAW_SIZE; i++) {
-        uint16_t msb = bits[i] ? (1 << 15) : 0x00;
-        // counter_top = 32 -> RF/32; value 16 = 50% duty -> Manchester symbol,
-        // polarity (msb) selects the transition direction from the data bit.
-        m_noralsy_pwm_seq_vals[i].channel_0 = msb | 16;
-        m_noralsy_pwm_seq_vals[i].counter_top = 32;
+        uint16_t msb = bits[i] ? (uint16_t)(1u << 15) : 0u;
+        m_noralsy_pwm_seq_vals[idx].channel_0 = msb | NORALSY_BIT_TOGGLE;
+        m_noralsy_pwm_seq_vals[idx].counter_top = NORALSY_BIT_TOP;
+        idx++;
     }
+
+    // --- Real T5577 SEQUENCE TERMINATOR: H16 L16 H48 L16 H32 (held entries) ---
+    // Reproduces the genuine tag's exact 128-sample (clk*4) ST that sits right
+    // before the BB0 preamble, so PM3 DetectST trims it correctly and consecutive
+    // preambles stay exactly 96 bits apart (what `lf noralsy demod` requires).
+    // POLARITY: LF_MOD low is UNLOADED (full-carrier HIGH envelope); LF_MOD high
+    // shorts the coil (LOW envelope). The long holds are UNLOADED (channel_0 = 0)
+    // so the LC tank free-runs at full amplitude (no droop), each bracketed by a
+    // brief 16-clock short. GLITCH-FREE: every held entry uses channel_0 = 0 (pin
+    // low) or counter_top+1 (pin high), never channel_0 == counter_top.
+    for (int i = 0; i < NORALSY_ST_LEN; i++) {
+        m_noralsy_pwm_seq_vals[idx].channel_0 = NORALSY_ST[i].channel_0;
+        m_noralsy_pwm_seq_vals[idx].counter_top = NORALSY_ST[i].counter_top;
+        idx++;
+    }
+
     return &m_noralsy_pwm_seq;
 }
 
